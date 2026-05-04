@@ -1,0 +1,27 @@
+export { OAUTH, PATHS, AUTH_ERROR_PATTERNS } from "./constants.js";
+
+export {
+  generatePKCE,
+  buildAuthorizeUrl,
+  exchangeCodeForTokens,
+  refreshAccessToken,
+  type OAuthTokens,
+  type PKCEChallenge,
+} from "./oauth.js";
+
+export {
+  readCredentials,
+  writeCredentials,
+  isTokenExpired,
+  getTokenExpiryInfo,
+  type CredentialsFile,
+} from "./credentials.js";
+
+export {
+  performHeadlessOAuth,
+  type AuthFlowOptions,
+} from "./auth-flow.js";
+
+export { runSetup } from "./setup.js";
+
+export { authenticate, type AuthenticateOptions, type AuthenticateResult } from "./authenticate.js";

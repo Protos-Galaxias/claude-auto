@@ -1,8 +1,16 @@
 {
   "name": "claude-auto",
   "version": "1.0.0",
-  "description": "Automatic Claude Code re-authentication CLI wrapper",
+  "description": "Automatic Claude Code re-authentication — CLI and library",
   "type": "module",
+  "main": "./dist/lib.js",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/lib.js",
+      "types": "./dist/lib.d.ts"
+    }
+  },
   "bin": {
     "claude-auto": "./dist/index.js"
   },
