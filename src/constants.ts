@@ -17,10 +17,16 @@ export const OAUTH = {
 
 export const PATHS = {
   claudeConfigDir: join(homedir(), ".claude"),
+  claudeSettingsFile: join(homedir(), ".claude", "settings.json"),
   credentialsFile: join(homedir(), ".claude", ".credentials.json"),
   autoConfigDir: join(homedir(), ".claude-auto"),
   googleStateFile: join(homedir(), ".claude-auto", "google-state.json"),
+  hookRelayScript: join(homedir(), ".claude-auto", "hook-relay.sh"),
 } as const;
+
+export const HOOK_RELAY_ENV = "CLAUDE_AUTO_RUN_SOCKET" as const;
+
+export const HOOK_RELAY_MARKER = "claude-auto:hook-relay" as const;
 
 export const AUTH_ERROR_PATTERNS = [
   "401",

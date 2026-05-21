@@ -17,10 +17,12 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "test": "tsc && node --test dist/__tests__/",
     "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "commander": "^13.0.0",
+    "node-pty": "^1.1.0",
     "playwright": "^1.52.0"
   },
   "devDependencies": {

@@ -12,6 +12,8 @@ import {
   getTokenExpiryInfo,
 } from "./credentials.js";
 import { runSetup } from "./setup.js";
+import { runInteractive, StopFailure } from "./interactive-runner.js";
+import { installHooks, uninstallHooks } from "./hook-installer.js";
 
 const program = new Command();
 
@@ -57,8 +59,44 @@ program
     await runClaude(claudeArgs);
   });
 
+program
+  .command("tui-p <prompt>")
+  .description(
+    "Run a single-turn prompt by driving the interactive TUI via PTY + hooks.\n" +
+      "Equivalent to `claude -p` but counts against subscription quota instead of API credits."
+  )
+  .option("--model <model>", "Override model (haiku/sonnet/opus)")
+  .option("--cwd <dir>", "Working directory for the spawned claude")
+  .option("--debug-tty", "Stream raw TUI output (ANSI) to stderr")
+  .option("--timeout <ms>", "Hard timeout in milliseconds", (v) => parseInt(v, 10))
+  .option("--skip-auth", "Skip claude-auto OAuth preflight and let the interactive claude CLI use its current auth state")
+  .option("--setting-sources <sources>", "Claude setting sources to load. Defaults to project,local to avoid user-level API env overrides")
+  .option("--skip-permissions", "Pass --dangerously-skip-permissions to claude (requires IS_SANDBOX=1)")
+  .option("--append-system-prompt <text>", "Append to system prompt")
+  .option("--mcp-config <path>", "Path to MCP config JSON")
+  .allowUnknownOption(false)
+  .action(async (prompt: string, opts) => {
+    await runTuiP(prompt, opts);
+  });
+
+program
+  .command("install-hooks")
+  .description("Install Stop/SubagentStop/StopFailure relay hooks into ~/.claude/settings.json")
+  .action(async () => {
+    await installHooks();
+    console.log("[claude-auto] hooks installed");
+  });
+
+program
+  .command("uninstall-hooks")
+  .description("Remove claude-auto relay hooks from ~/.claude/settings.json")
+  .action(async () => {
+    await uninstallHooks();
+    console.log("[claude-auto] hooks removed");
+  });
+
 async function main(): Promise<void> {
-  const knownCommands = ["setup", "refresh", "status", "help"];
+  const knownCommands = ["setup", "refresh", "status", "help", "tui-p", "install-hooks", "uninstall-hooks", "run"];
   const firstArg = process.argv[2];
   const isOwnFlag = !firstArg || firstArg === "--help" || firstArg === "-h" || firstArg === "--version" || firstArg === "-v" || firstArg === "-V";
 
@@ -70,6 +108,59 @@ async function main(): Promise<void> {
   }
 
   await program.parseAsync(process.argv);
+}
+
+interface TuiPOptions {
+  model?: string;
+  cwd?: string;
+  debugTty?: boolean;
+  timeout?: number;
+  skipAuth?: boolean;
+  settingSources?: string;
+  skipPermissions?: boolean;
+  appendSystemPrompt?: string;
+  mcpConfig?: string;
+}
+
+async function runTuiP(prompt: string, opts: TuiPOptions): Promise<void> {
+  const args: string[] = [];
+  if (opts.model) {
+    args.push("--model", opts.model);
+  }
+  if (opts.skipPermissions) {
+    args.push("--dangerously-skip-permissions");
+  }
+  if (opts.appendSystemPrompt) {
+    args.push("--append-system-prompt", opts.appendSystemPrompt);
+  }
+  if (opts.mcpConfig) {
+    args.push("--mcp-config", opts.mcpConfig);
+  }
+
+  try {
+    const result = await runInteractive({
+      prompt,
+      args,
+      cwd: opts.cwd,
+      timeoutMs: opts.timeout,
+      debugTty: opts.debugTty ? process.stderr : undefined,
+      skipAuth: opts.skipAuth,
+      settingSources: opts.settingSources,
+    });
+
+    process.stdout.write(result.text);
+    if (!result.text.endsWith("\n")) {
+      process.stdout.write("\n");
+    }
+    process.exit(0);
+  } catch (err) {
+    if (err instanceof StopFailure) {
+      console.error(`[claude-auto] ${err.message}`);
+      process.exit(2);
+    }
+    console.error(`[claude-auto] ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
 }
 
 function extractClaudeArgs(): string[] {

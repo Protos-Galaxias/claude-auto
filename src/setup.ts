@@ -2,11 +2,16 @@ import { chromium } from "playwright";
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { PATHS } from "./constants.js";
+import { installHooks } from "./hook-installer.js";
 
 export async function runSetup(): Promise<void> {
   if (!existsSync(PATHS.autoConfigDir)) {
     await mkdir(PATHS.autoConfigDir, { recursive: true });
   }
+
+  await installHooks();
+  console.log(`[claude-auto] Hook relay installed: ${PATHS.hookRelayScript}`);
+  console.log(`[claude-auto] Patched ${PATHS.claudeSettingsFile} with Stop/SubagentStop/StopFailure hooks (no-op unless CLAUDE_AUTO_RUN_SOCKET is set).`);
 
   console.log(
     "[claude-auto] Opening browser for Google login.\n" +

@@ -25,3 +25,13 @@ export {
 export { runSetup } from "./setup.js";
 
 export { authenticate, type AuthenticateOptions, type AuthenticateResult } from "./authenticate.js";
+
+export {
+  runInteractive,
+  AuthRetryNeeded,
+  StopFailure,
+  type RunInteractiveOptions,
+  type RunInteractiveResult,
+} from "./interactive-runner.js";
+
+export { installHooks, uninstallHooks } from "./hook-installer.js";
