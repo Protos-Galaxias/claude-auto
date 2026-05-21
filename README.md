@@ -75,6 +75,29 @@ claude-auto -p 'explain this code'
 
 All arguments are passed through to `claude`. If auth fails, re-auth happens automatically.
 
+### `tui-p`: TUI-driven `-p` (subscription-friendly)
+
+Starting June 15 2026, Anthropic moves `claude -p` / Agent SDK / GitHub Actions usage into a separate "Agent SDK Credit pool" billed at API rates — subscription quota no longer applies to programmatic access.
+
+`claude-auto tui-p` works around this by spawning the **interactive** TUI in a pseudo-TTY (via `node-pty`), typing the prompt for you, and grabbing the final assistant message from a `Stop` lifecycle hook (so no ANSI/TTY parsing). The output is captured server-side via `last_assistant_message`, not by reading stdout.
+
+```bash
+# One-time: installs hook relay + patches ~/.claude/settings.json
+claude-auto setup
+
+# Drop-in replacement for `claude -p`
+claude-auto tui-p 'explain this code' --skip-permissions --model sonnet
+
+# Works with prompts that spawn subagents — main Stop fires after all SubagentStop
+claude-auto tui-p 'Spawn an Explore subagent to count .ts files, then report the count.'
+```
+
+See [TUI_TEST.md](./TUI_TEST.md) for the test recipe (including the subagent case).
+
+The hooks installed by `setup` are no-ops unless `CLAUDE_AUTO_RUN_SOCKET` is set in the environment, so they don't affect your regular interactive `claude` sessions.
+
+To remove them: `claude-auto uninstall-hooks`.
+
 ### In scripts
 
 ```bash
