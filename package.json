@@ -18,6 +18,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "tsc && node --test dist/__tests__/",
+    "prepare": "tsc",
     "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
