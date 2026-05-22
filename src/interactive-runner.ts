@@ -14,6 +14,7 @@ import {
 } from "./ipc-server.js";
 import { parseTranscriptUsage, type UsageStats } from "./usage-parser.js";
 import { throwIfAborted, withAbort } from "./abort.js";
+import { detectStartupDialog, wantsBypassPermissions } from "./bypass-dialog.js";
 
 import pty from "node-pty";
 
@@ -21,6 +22,7 @@ const require = createRequire(import.meta.url);
 const READY_QUIET_MS = 800;
 const READY_MAX_WAIT_MS = 8000;
 const KILL_AFTER_EXIT_MS = 1500;
+const BYPASS_DIALOG_BUFFER_BYTES = 16 * 1024;
 
 export interface ToolUseEvent {
   /** Tool name (e.g. "Read", "Bash", "Edit"). */
@@ -175,9 +177,12 @@ async function runOnce(opts: RunInteractiveOptions): Promise<RunInteractiveResul
 
   const abortCleanup = wireAbort(opts.signal, child, ipc);
 
+  const recorder = recordRecentOutput(child, BYPASS_DIALOG_BUFFER_BYTES);
+
   try {
     await withAbort(opts.signal, async () => {
       await waitForReady(child);
+      await acceptStartupDialogsIfShown(child, recorder, opts);
       await sendPrompt(child, opts.prompt);
     });
 
@@ -205,8 +210,78 @@ async function runOnce(opts: RunInteractiveOptions): Promise<RunInteractiveResul
       usage,
     };
   } finally {
+    recorder.dispose();
     abortCleanup();
     await shutdown(child, exitPromise, exitInfo, ipc, runDir);
+  }
+}
+
+interface TtyRecorder {
+  getRecent: () => string;
+  reset: () => void;
+  dispose: () => void;
+}
+
+/**
+ * Subscribes to the PTY data stream and keeps the last `maxBytes` of raw
+ * output in a circular buffer. Used to scan for first-time TUI dialogs
+ * (e.g. the `--dangerously-skip-permissions` acceptance prompt).
+ *
+ * `reset()` clears the buffer — call it between dialog-accept iterations so
+ * we don't re-detect a dialog from text that's already on screen.
+ */
+function recordRecentOutput(child: pty.IPty, maxBytes: number): TtyRecorder {
+  let buf = "";
+  const sub = child.onData((d) => {
+    buf += d;
+    if (buf.length > maxBytes) {
+      buf = buf.slice(buf.length - maxBytes);
+    }
+  });
+
+  return {
+    getRecent: () => buf,
+    reset: () => {
+      buf = "";
+    },
+    dispose: () => sub.dispose(),
+  };
+}
+
+const MAX_STARTUP_DIALOGS = 3;
+
+/**
+ * On a first run in a project, claude's TUI can show one or two startup
+ * dialogs before mounting the chat input: the trust-folder dialog and (if
+ * `--dangerously-skip-permissions` is set) the bypass-permissions dialog.
+ *
+ * This handles both, in whatever order they appear, by scanning the recent
+ * TTY buffer between quiet periods and submitting the safe response
+ * ("1\r" for trust, "2\r" for bypass-accept). No-op when no known dialog
+ * is detected, so it costs ~nothing on the steady-state path.
+ *
+ * Capped at MAX_STARTUP_DIALOGS iterations as a safety net — if a future
+ * TUI version adds a dialog we don't know about, we bail out instead of
+ * looping forever.
+ */
+async function acceptStartupDialogsIfShown(
+  child: pty.IPty,
+  recorder: TtyRecorder,
+  opts: RunInteractiveOptions
+): Promise<void> {
+  for (let i = 0; i < MAX_STARTUP_DIALOGS; i += 1) {
+    const dialog = detectStartupDialog(recorder.getRecent());
+    if (!dialog) {
+      return;
+    }
+    if (dialog.kind === "bypass" && !wantsBypassPermissions(opts.args)) {
+      // Bypass dialog shouldn't appear without the flag, but if it does and
+      // we didn't ask for it, refuse to auto-accept on the user's behalf.
+      return;
+    }
+    child.write(dialog.response);
+    recorder.reset();
+    await waitForReady(child);
   }
 }
 

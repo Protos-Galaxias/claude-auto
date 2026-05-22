@@ -33,18 +33,32 @@ interface AssistantLine {
  * Parses a Claude Code session transcript JSONL and aggregates main-agent
  * token usage. Parallel tool calls within one turn share `message.id` and are
  * deduplicated. Returns undefined if no usable usage entries are found.
+ *
+ * The Stop hook fires before claude flushes the final assistant entry to
+ * disk in some cases (observed on fresh-project sessions), so this retries
+ * a few times with short backoffs before giving up.
  */
 export async function parseTranscriptUsage(
   transcriptPath: string
 ): Promise<UsageStats | undefined> {
-  let raw: string;
-  try {
-    raw = await readFile(transcriptPath, "utf8");
-  } catch {
-    return undefined;
+  const delaysMs = [0, 50, 150, 400];
+  for (const wait of delaysMs) {
+    if (wait > 0) {
+      await new Promise((r) => setTimeout(r, wait));
+    }
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, "utf8");
+    } catch {
+      continue;
+    }
+    const u = aggregateUsage(raw);
+    if (u !== undefined) {
+      return u;
+    }
   }
 
-  return aggregateUsage(raw);
+  return undefined;
 }
 
 export function aggregateUsage(jsonl: string): UsageStats | undefined {

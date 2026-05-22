@@ -145,6 +145,41 @@ test("parseTranscriptUsage returns undefined when file doesn't exist", async () 
   assert.equal(u, undefined);
 });
 
+test("parseTranscriptUsage waits for a deferred write of the assistant entry", async () => {
+  // Stop hook can fire before claude has flushed the final assistant entry to
+  // disk on fresh-project sessions. Parser should retry briefly.
+  const dir = mkdtempSync(join(tmpdir(), "ca-usage-retry-"));
+  const path = join(dir, "transcript.jsonl");
+  try {
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "user", message: { content: "hi" } }),
+        JSON.stringify({ type: "permission-mode", permissionMode: "default" }),
+      ].join("\n") + "\n"
+    );
+
+    setTimeout(() => {
+      writeFileSync(
+        path,
+        [
+          JSON.stringify({ type: "user", message: { content: "hi" } }),
+          JSON.stringify({ type: "permission-mode", permissionMode: "default" }),
+          assistantLine({ id: "m_late", input: 7, output: 4, cacheRead: 100 }),
+        ].join("\n") + "\n"
+      );
+    }, 75);
+
+    const u = await parseTranscriptUsage(path);
+    assert.ok(u, "parser should eventually pick up the late assistant entry");
+    assert.equal(u.inputTokens, 7);
+    assert.equal(u.outputTokens, 4);
+    assert.equal(u.cacheReadTokens, 100);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("parseTranscriptUsage reads a real on-disk file", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ca-usage-"));
   const path = join(dir, "transcript.jsonl");
