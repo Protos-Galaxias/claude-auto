@@ -17,6 +17,7 @@ s.close()
 `;
 
 const RELAY_EVENTS = ["Stop", "SubagentStop", "StopFailure"] as const;
+const TOOL_USE_EVENTS = ["PreToolUse"] as const;
 
 interface HookHandler {
   type: string;
@@ -120,12 +121,23 @@ export function mergeHooks(settings: SettingsFile, relayScriptPath: string): Set
   return { ...settings, hooks };
 }
 
-export function createHookSettings(relayScriptPath: string): SettingsFile {
+export interface HookSettingsOptions {
+  /** Wire PreToolUse hook so the runner sees tool invocations live. Off by default. */
+  includeToolUse?: boolean;
+}
+
+export function createHookSettings(
+  relayScriptPath: string,
+  opts: HookSettingsOptions = {}
+): SettingsFile {
   const handler = createRelayHandler(relayScriptPath);
+  const events: readonly string[] = opts.includeToolUse
+    ? [...RELAY_EVENTS, ...TOOL_USE_EVENTS]
+    : RELAY_EVENTS;
 
   return {
     hooks: Object.fromEntries(
-      RELAY_EVENTS.map((event) => [event, [{ hooks: [handler] }]])
+      events.map((event) => [event, [{ hooks: [handler] }]])
     ),
   };
 }

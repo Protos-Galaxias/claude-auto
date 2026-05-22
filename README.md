@@ -98,6 +98,41 @@ The hooks installed by `setup` are no-ops unless `CLAUDE_AUTO_RUN_SOCKET` is set
 
 To remove them: `claude-auto uninstall-hooks`.
 
+### Programmatic API (`runInteractive`)
+
+```ts
+import { runInteractive } from "claude-auto";
+
+const controller = new AbortController();
+
+const result = await runInteractive({
+  prompt: "Read package.json and summarize.",
+  args: ["--dangerously-skip-permissions", "--model", "sonnet"],
+  signal: controller.signal,
+  onToolUse: (ev) => {
+    // Fires per main-agent PreToolUse. Pass includeSubagentTools: true to also see subagents.
+    console.log(`🔧 ${ev.name}`);
+  },
+});
+
+console.log(result.text);
+console.log(result.usage);
+//   { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, cacheHitRatio }
+
+// Anywhere else: controller.abort() — kills the PTY and rejects with AbortError.
+```
+
+**Options highlights:**
+
+| Option | Purpose |
+|---|---|
+| `signal` | Standard `AbortSignal`. Aborting kills the PTY (~100ms) and rejects with `AbortError` (`code: "ABORT_ERR"`). |
+| `onToolUse` | Live callback per `PreToolUse` (`{ name, input?, agentId?, agentType?, toolUseId? }`). Main agent only by default. |
+| `includeSubagentTools` | Also forward subagent `PreToolUse` events. Off by default (noisy: Read x10 per `Task`). |
+| `result.usage` | Aggregated main-agent token usage parsed from the transcript. Parallel tool calls dedup by `message.id`. Subagent usage excluded (use `result.subagents` + transcripts of their sidechains for that). |
+
+See [INVESTIGATION-NOTES.md](./INVESTIGATION-NOTES.md) for known TUI quirks (e.g. `--model + --resume` without `--append-system-prompt`).
+
 ### In scripts
 
 ```bash

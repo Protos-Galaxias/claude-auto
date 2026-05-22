@@ -26,7 +26,26 @@ export interface StopFailureEvent {
   last_assistant_message?: string;
 }
 
-export type HookEvent = StopEvent | SubagentStopEvent | StopFailureEvent;
+export interface PreToolUseEvent {
+  hook_event_name: "PreToolUse";
+  session_id: string;
+  tool_name: string;
+  tool_input?: unknown;
+  tool_use_id?: string;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+export type HookEvent =
+  | StopEvent
+  | SubagentStopEvent
+  | StopFailureEvent
+  | PreToolUseEvent;
+
+export interface IpcServerOptions {
+  /** Called for every parsed hook event, before terminal-event routing. */
+  onEvent?: (ev: HookEvent) => void;
+}
 
 export interface IpcServerHandle {
   server: Server;
@@ -38,7 +57,10 @@ export interface IpcServerHandle {
   close: () => void;
 }
 
-export function startIpcServer(sockPath: string): IpcServerHandle {
+export function startIpcServer(
+  sockPath: string,
+  opts: IpcServerOptions = {}
+): IpcServerHandle {
   if (existsSync(sockPath)) {
     rmSync(sockPath, { force: true });
   }
@@ -61,7 +83,7 @@ export function startIpcServer(sockPath: string): IpcServerHandle {
       }
       try {
         const ev = JSON.parse(raw) as HookEvent;
-        handleEvent(ev, subagents, resolveDone);
+        handleEvent(ev, subagents, resolveDone, opts.onEvent);
       } catch (err) {
         rejectDone(new Error(`Bad hook payload: ${err instanceof Error ? err.message : err}`));
       }
@@ -98,8 +120,17 @@ export function startIpcServer(sockPath: string): IpcServerHandle {
 function handleEvent(
   ev: HookEvent,
   subagents: SubagentStopEvent[],
-  resolveDone: (e: StopEvent | StopFailureEvent) => void
+  resolveDone: (e: StopEvent | StopFailureEvent) => void,
+  onEvent?: (ev: HookEvent) => void
 ): void {
+  if (onEvent) {
+    try {
+      onEvent(ev);
+    } catch {
+      // Listener errors must not break the IPC loop.
+    }
+  }
+
   if (ev.hook_event_name === "SubagentStop") {
     subagents.push(ev);
 
