@@ -158,3 +158,86 @@ test("startIpcServer ignores empty payloads", async () => {
   ipc.close();
   assert.equal(raced, "pending");
 });
+
+test("startIpcServer forwards every event to onEvent listener", async () => {
+  const p = sockPath();
+  const seen: HookEvent[] = [];
+  const ipc = startIpcServer(p, { onEvent: (ev) => seen.push(ev) });
+
+  await send(p, {
+    hook_event_name: "PreToolUse",
+    session_id: "s5",
+    tool_name: "Bash",
+    tool_input: { command: "ls" },
+    tool_use_id: "tu1",
+  });
+  await send(p, {
+    hook_event_name: "PreToolUse",
+    session_id: "s5",
+    tool_name: "Read",
+    tool_input: { file_path: "/tmp/x" },
+  });
+  await send(p, {
+    hook_event_name: "Stop",
+    session_id: "s5",
+    transcript_path: "/tmp/x.jsonl",
+    last_assistant_message: "done",
+  });
+
+  await ipc.done;
+  ipc.close();
+
+  assert.equal(seen.length, 3);
+  assert.equal(seen[0].hook_event_name, "PreToolUse");
+  assert.equal((seen[0] as any).tool_name, "Bash");
+  assert.equal(seen[1].hook_event_name, "PreToolUse");
+  assert.equal((seen[1] as any).tool_name, "Read");
+  assert.equal(seen[2].hook_event_name, "Stop");
+});
+
+test("startIpcServer keeps running when onEvent throws", async () => {
+  const p = sockPath();
+  let calls = 0;
+  const ipc = startIpcServer(p, {
+    onEvent: () => {
+      calls += 1;
+      throw new Error("listener boom");
+    },
+  });
+
+  await send(p, {
+    hook_event_name: "PreToolUse",
+    session_id: "s6",
+    tool_name: "Bash",
+  });
+  await send(p, {
+    hook_event_name: "Stop",
+    session_id: "s6",
+    transcript_path: "/tmp/x.jsonl",
+    last_assistant_message: "ok",
+  });
+
+  const ev = await ipc.done;
+  ipc.close();
+
+  assert.equal(calls, 2);
+  assert.equal(ev.hook_event_name, "Stop");
+});
+
+test("startIpcServer routes PreToolUse to listener but does not resolve done", async () => {
+  const p = sockPath();
+  const ipc = startIpcServer(p, { onEvent: () => {} });
+
+  await send(p, {
+    hook_event_name: "PreToolUse",
+    session_id: "s7",
+    tool_name: "Edit",
+  });
+
+  const raced = await Promise.race([
+    ipc.done.then(() => "resolved"),
+    new Promise((r) => setTimeout(() => r("pending"), 100)),
+  ]);
+  ipc.close();
+  assert.equal(raced, "pending");
+});

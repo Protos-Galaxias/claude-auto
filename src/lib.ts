@@ -32,6 +32,21 @@ export {
   StopFailure,
   type RunInteractiveOptions,
   type RunInteractiveResult,
+  type ToolUseEvent,
 } from "./interactive-runner.js";
+
+export {
+  parseTranscriptUsage,
+  aggregateUsage,
+  type UsageStats,
+} from "./usage-parser.js";
+
+export {
+  type StopEvent,
+  type SubagentStopEvent,
+  type StopFailureEvent,
+  type PreToolUseEvent,
+  type HookEvent,
+} from "./ipc-server.js";
 
 export { installHooks, uninstallHooks } from "./hook-installer.js";

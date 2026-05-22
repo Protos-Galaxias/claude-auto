@@ -8,6 +8,7 @@ import {
   uninstallHooks,
   mergeHooks,
   removeHooks,
+  createHookSettings,
   type HookPaths,
   type SettingsFile,
 } from "../hook-installer.js";
@@ -170,6 +171,24 @@ test("uninstallHooks is safe to call when settings does not exist", async () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("createHookSettings omits PreToolUse by default", () => {
+  const s = createHookSettings("/relay.sh");
+  assert.deepEqual(
+    Object.keys(s.hooks!).sort(),
+    ["Stop", "StopFailure", "SubagentStop"]
+  );
+});
+
+test("createHookSettings includes PreToolUse when includeToolUse is true", () => {
+  const s = createHookSettings("/relay.sh", { includeToolUse: true });
+  assert.deepEqual(
+    Object.keys(s.hooks!).sort(),
+    ["PreToolUse", "Stop", "StopFailure", "SubagentStop"]
+  );
+  assert.equal(s.hooks!.PreToolUse.length, 1);
+  assert.match(s.hooks!.PreToolUse[0].hooks[0].command, /\/relay\.sh/);
 });
 
 test("install then uninstall returns settings to original state", async () => {

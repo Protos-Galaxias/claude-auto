@@ -7,9 +7,14 @@ import { createHookSettings, installHooks } from "./hook-installer.js";
 import { HOOK_RELAY_ENV, PATHS } from "./constants.js";
 import {
   startIpcServer,
+  type HookEvent,
+  type PreToolUseEvent,
   type SubagentStopEvent,
   type StopFailureEvent,
 } from "./ipc-server.js";
+import { parseTranscriptUsage, type UsageStats } from "./usage-parser.js";
+import { throwIfAborted, withAbort } from "./abort.js";
+import { detectStartupDialog, wantsBypassPermissions } from "./bypass-dialog.js";
 
 import pty from "node-pty";
 
@@ -17,6 +22,20 @@ const require = createRequire(import.meta.url);
 const READY_QUIET_MS = 800;
 const READY_MAX_WAIT_MS = 8000;
 const KILL_AFTER_EXIT_MS = 1500;
+const BYPASS_DIALOG_BUFFER_BYTES = 16 * 1024;
+
+export interface ToolUseEvent {
+  /** Tool name (e.g. "Read", "Bash", "Edit"). */
+  name: string;
+  /** Raw tool input as Claude sent it. Not sanitized. */
+  input?: unknown;
+  /** Subagent id if this came from a subagent (only set when includeSubagentTools is true). */
+  agentId?: string;
+  /** Subagent type if this came from a subagent. */
+  agentType?: string;
+  /** Claude's tool_use_id (useful for correlating with PostToolUse later). */
+  toolUseId?: string;
+}
 
 export interface RunInteractiveOptions {
   /** User prompt to send to Claude (will be typed into the TUI). */
@@ -35,6 +54,17 @@ export interface RunInteractiveOptions {
   skipAuth?: boolean;
   /** Sources Claude should load settings from. Defaults to project/local only to avoid user-level API env overrides. */
   settingSources?: string;
+  /** External cancellation. On abort the PTY is killed, IPC closed, and the call rejects with AbortError. */
+  signal?: AbortSignal;
+  /**
+   * Live callback fired on every PreToolUse event. Wires up PreToolUse hook in
+   * the per-run settings file. By default only main-agent tool calls are forwarded;
+   * pass {@link RunInteractiveOptions.includeSubagentTools} to also see subagent tools.
+   * Listener errors are swallowed.
+   */
+  onToolUse?: (ev: ToolUseEvent) => void;
+  /** Forward subagent PreToolUse events to onToolUse too. Off by default (noisy). */
+  includeSubagentTools?: boolean;
 }
 
 export interface RunInteractiveResult {
@@ -46,6 +76,8 @@ export interface RunInteractiveResult {
   transcriptPath: string;
   /** All SubagentStop events captured during the run. */
   subagents: SubagentStopEvent[];
+  /** Aggregated main-agent token usage parsed from the transcript. Undefined if parse failed. */
+  usage?: UsageStats;
 }
 
 export class AuthRetryNeeded extends Error {
@@ -61,6 +93,8 @@ export class StopFailure extends Error {
 }
 
 export async function runInteractive(opts: RunInteractiveOptions): Promise<RunInteractiveResult> {
+  throwIfAborted(opts.signal);
+
   if (!opts.skipHookInstall) {
     await installHooks();
   }
@@ -68,11 +102,15 @@ export async function runInteractive(opts: RunInteractiveOptions): Promise<RunIn
     await authenticate({ silent: true });
   }
 
+  throwIfAborted(opts.signal);
+
   try {
     return await runOnce(opts);
   } catch (err) {
     if (err instanceof AuthRetryNeeded) {
+      throwIfAborted(opts.signal);
       await authenticate({ force: true, silent: true });
+      throwIfAborted(opts.signal);
 
       return await runOnce(opts);
     }
@@ -84,13 +122,20 @@ async function runOnce(opts: RunInteractiveOptions): Promise<RunInteractiveResul
   const runDir = mkdtempSync(join(tmpdir(), "claude-auto-"));
   const sockPath = join(runDir, "ipc.sock");
   const settingsPath = join(runDir, "settings.json");
+  const wantsToolUse = typeof opts.onToolUse === "function";
   writeFileSync(
     settingsPath,
-    JSON.stringify(createHookSettings(PATHS.hookRelayScript), null, 2) + "\n",
+    JSON.stringify(
+      createHookSettings(PATHS.hookRelayScript, { includeToolUse: wantsToolUse }),
+      null,
+      2
+    ) + "\n",
     { encoding: "utf8" }
   );
 
-  const ipc = startIpcServer(sockPath);
+  const ipc = startIpcServer(sockPath, {
+    onEvent: makeIpcEventListener(opts),
+  });
 
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
@@ -130,12 +175,23 @@ async function runOnce(opts: RunInteractiveOptions): Promise<RunInteractiveResul
     }
   });
 
+  const abortCleanup = wireAbort(opts.signal, child, ipc);
+
+  const recorder = recordRecentOutput(child, BYPASS_DIALOG_BUFFER_BYTES);
+
   try {
-    await waitForReady(child);
-    await sendPrompt(child, opts.prompt);
+    await withAbort(opts.signal, async () => {
+      await waitForReady(child);
+      await acceptStartupDialogsIfShown(child, recorder, opts);
+      await sendPrompt(child, opts.prompt);
+    });
 
     const timeout = opts.timeoutMs ?? 10 * 60_000;
-    const event = await raceWithTimeout(ipc.done, timeout);
+    const event = await withAbort(opts.signal, () =>
+      raceWithTimeout(ipc.done, timeout).catch((err) => {
+        throw enrichTimeoutError(err, opts);
+      })
+    );
 
     if (event.hook_event_name === "StopFailure") {
       if (event.error === "authentication_failed") {
@@ -144,15 +200,129 @@ async function runOnce(opts: RunInteractiveOptions): Promise<RunInteractiveResul
       throw new StopFailure(event);
     }
 
+    const usage = await parseTranscriptUsage(event.transcript_path);
+
     return {
       text: event.last_assistant_message ?? "",
       sessionId: event.session_id,
       transcriptPath: event.transcript_path,
       subagents: ipc.subagents,
+      usage,
     };
   } finally {
+    recorder.dispose();
+    abortCleanup();
     await shutdown(child, exitPromise, exitInfo, ipc, runDir);
   }
+}
+
+interface TtyRecorder {
+  getRecent: () => string;
+  reset: () => void;
+  dispose: () => void;
+}
+
+/**
+ * Subscribes to the PTY data stream and keeps the last `maxBytes` of raw
+ * output in a circular buffer. Used to scan for first-time TUI dialogs
+ * (e.g. the `--dangerously-skip-permissions` acceptance prompt).
+ *
+ * `reset()` clears the buffer — call it between dialog-accept iterations so
+ * we don't re-detect a dialog from text that's already on screen.
+ */
+function recordRecentOutput(child: pty.IPty, maxBytes: number): TtyRecorder {
+  let buf = "";
+  const sub = child.onData((d) => {
+    buf += d;
+    if (buf.length > maxBytes) {
+      buf = buf.slice(buf.length - maxBytes);
+    }
+  });
+
+  return {
+    getRecent: () => buf,
+    reset: () => {
+      buf = "";
+    },
+    dispose: () => sub.dispose(),
+  };
+}
+
+const MAX_STARTUP_DIALOGS = 3;
+
+/**
+ * On a first run in a project, claude's TUI can show one or two startup
+ * dialogs before mounting the chat input: the trust-folder dialog and (if
+ * `--dangerously-skip-permissions` is set) the bypass-permissions dialog.
+ *
+ * This handles both, in whatever order they appear, by scanning the recent
+ * TTY buffer between quiet periods and submitting the safe response
+ * ("1\r" for trust, "2\r" for bypass-accept). No-op when no known dialog
+ * is detected, so it costs ~nothing on the steady-state path.
+ *
+ * Capped at MAX_STARTUP_DIALOGS iterations as a safety net — if a future
+ * TUI version adds a dialog we don't know about, we bail out instead of
+ * looping forever.
+ */
+async function acceptStartupDialogsIfShown(
+  child: pty.IPty,
+  recorder: TtyRecorder,
+  opts: RunInteractiveOptions
+): Promise<void> {
+  for (let i = 0; i < MAX_STARTUP_DIALOGS; i += 1) {
+    const dialog = detectStartupDialog(recorder.getRecent());
+    if (!dialog) {
+      return;
+    }
+    if (dialog.kind === "bypass" && !wantsBypassPermissions(opts.args)) {
+      // Bypass dialog shouldn't appear without the flag, but if it does and
+      // we didn't ask for it, refuse to auto-accept on the user's behalf.
+      return;
+    }
+    child.write(dialog.response);
+    recorder.reset();
+    await waitForReady(child);
+  }
+}
+
+function makeIpcEventListener(opts: RunInteractiveOptions): ((ev: HookEvent) => void) | undefined {
+  const onToolUse = opts.onToolUse;
+  if (!onToolUse) {
+    return;
+  }
+  const includeSub = opts.includeSubagentTools === true;
+
+  return (ev) => {
+    if (ev.hook_event_name !== "PreToolUse") {
+      return;
+    }
+    if (!includeSub && ev.agent_id) {
+      return;
+    }
+    try {
+      onToolUse(toToolUseEvent(ev));
+    } catch {
+      // Caller-provided callback errors must never break the run.
+    }
+  };
+}
+
+function toToolUseEvent(ev: PreToolUseEvent): ToolUseEvent {
+  const out: ToolUseEvent = { name: ev.tool_name };
+  if (ev.tool_input !== undefined) {
+    out.input = ev.tool_input;
+  }
+  if (ev.agent_id) {
+    out.agentId = ev.agent_id;
+  }
+  if (ev.agent_type) {
+    out.agentType = ev.agent_type;
+  }
+  if (ev.tool_use_id) {
+    out.toolUseId = ev.tool_use_id;
+  }
+
+  return out;
 }
 
 function waitForReady(child: pty.IPty): Promise<void> {
@@ -160,7 +330,7 @@ function waitForReady(child: pty.IPty): Promise<void> {
     let lastChunkAt = Date.now();
     let resolved = false;
 
-    const finish = () => {
+    const finish = (): void => {
       if (!resolved) {
         resolved = true;
         sub.dispose();
@@ -231,7 +401,9 @@ async function shutdown(
 ): Promise<void> {
   try {
     if (!exitInfo) {
-      child.write("/exit\r");
+      try {
+        child.write("/exit\r");
+      } catch {}
       await raceWithTimeout(exitPromise, KILL_AFTER_EXIT_MS).catch(() => {
         try {
           child.kill();
@@ -263,4 +435,49 @@ function raceWithTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
       }
     );
   });
+}
+
+/**
+ * Adds a diagnostic hint when a timeout matches the known `--model + --resume`
+ * without `--append-system-prompt` quirk. See notes in INVESTIGATION-NOTES.md.
+ */
+function enrichTimeoutError(err: unknown, opts: RunInteractiveOptions): unknown {
+  if (!(err instanceof Error) || !err.message.startsWith("Timed out after ")) {
+    return err;
+  }
+  const args = opts.args ?? [];
+  const hasResume = args.includes("--resume");
+  const hasModel = args.includes("--model");
+  const hasSystemPrompt = args.includes("--append-system-prompt") || args.includes("--system-prompt");
+  if (hasResume && hasModel && !hasSystemPrompt) {
+    err.message += " — hint: --model + --resume without --append-system-prompt is a known TUI quirk (see INVESTIGATION-NOTES.md). Try adding a non-empty --append-system-prompt to args.";
+  }
+
+  return err;
+}
+
+function wireAbort(
+  signal: AbortSignal | undefined,
+  child: pty.IPty,
+  ipc: { close: () => void }
+): () => void {
+  if (!signal) {
+    return () => {};
+  }
+  const onAbort = (): void => {
+    try {
+      child.kill();
+    } catch {}
+    try {
+      ipc.close();
+    } catch {}
+  };
+  if (signal.aborted) {
+    onAbort();
+
+    return () => {};
+  }
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  return () => signal.removeEventListener("abort", onAbort);
 }
