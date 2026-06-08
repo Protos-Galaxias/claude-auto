@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { AUTH_ERROR_PATTERNS } from "./constants.js";
+import { AUTH_ERROR_PATTERNS, PATHS } from "./constants.js";
 import { performHeadlessOAuth } from "./auth-flow.js";
 import { refreshAccessToken } from "./oauth.js";
 import {
@@ -14,6 +14,7 @@ import {
 import { runSetup } from "./setup.js";
 import { runInteractive, StopFailure } from "./interactive-runner.js";
 import { installHooks, uninstallHooks } from "./hook-installer.js";
+import { logger, errMessage } from "./logger.js";
 
 const program = new Command();
 
@@ -155,10 +156,10 @@ async function runTuiP(prompt: string, opts: TuiPOptions): Promise<void> {
     process.exit(0);
   } catch (err) {
     if (err instanceof StopFailure) {
-      console.error(`[claude-auto] ${err.message}`);
+      logger.error(err.message);
       process.exit(2);
     }
-    console.error(`[claude-auto] ${err instanceof Error ? err.message : err}`);
+    logger.error(errMessage(err));
     process.exit(1);
   }
 }
@@ -222,36 +223,32 @@ async function tryRefreshExisting(): Promise<boolean> {
     return false;
   }
 
-  console.error("[claude-auto] Attempting token refresh...");
+  logger.info("Attempting token refresh...");
 
   try {
     const tokens = await refreshAccessToken(creds.claudeAiOauth.refreshToken);
     await writeCredentials(tokens);
-    console.error("[claude-auto] Token refresh successful.");
+    logger.info("Token refresh successful.");
 
     return true;
   } catch (err) {
-    console.error(
-      `[claude-auto] Token refresh failed: ${err instanceof Error ? err.message : err}`
-    );
+    logger.warn(`Token refresh failed: ${errMessage(err)}`);
 
     return false;
   }
 }
 
 async function performFullReauth(debug = false): Promise<boolean> {
-  console.error("[claude-auto] Starting full OAuth re-authentication...");
+  logger.info("Starting full OAuth re-authentication...");
 
   try {
     const tokens = await performHeadlessOAuth({ debug });
     await writeCredentials(tokens);
-    console.error("[claude-auto] Full re-authentication successful.");
+    logger.info("Full re-authentication successful.");
 
     return true;
   } catch (err) {
-    console.error(
-      `[claude-auto] Full re-auth failed: ${err instanceof Error ? err.message : err}`
-    );
+    logger.error(`Full re-auth failed: ${errMessage(err)}`);
 
     return false;
   }
@@ -268,25 +265,25 @@ async function runClaude(args: string[]): Promise<void> {
     process.exit(result.exitCode);
   }
 
-  console.error("\n[claude-auto] Authentication error detected. Attempting recovery...\n");
+  logger.warn("Authentication error detected. Attempting recovery...");
 
   const refreshed = await tryRefreshExisting();
   if (refreshed) {
-    console.error("[claude-auto] Retrying command...\n");
+    logger.info("Retrying command after token refresh...");
     const retry = await spawnClaude(args);
     process.exit(retry.exitCode);
   }
 
   const reauthed = await performFullReauth();
   if (reauthed) {
-    console.error("[claude-auto] Retrying command...\n");
+    logger.info("Retrying command after full re-auth...");
     const retry = await spawnClaude(args);
     process.exit(retry.exitCode);
   }
 
-  console.error(
-    "[claude-auto] All recovery attempts failed.\n" +
-      "Try running 'claude-auto setup' to refresh your Google session."
+  logger.error(
+    "All recovery attempts failed. Run 'claude-auto setup' to refresh your Google session. " +
+      `See ${PATHS.logFile} for details.`
   );
   process.exit(1);
 }
@@ -299,17 +296,28 @@ async function forceReauth(debug = false): Promise<void> {
 
   const reauthed = await performFullReauth(debug);
   if (!reauthed) {
-    console.error("[claude-auto] Force re-auth failed.");
+    logger.error(`Force re-auth failed. See ${PATHS.logFile} for details.`);
     process.exit(1);
   }
 }
 
 async function showStatus(): Promise<void> {
+  const { existsSync } = await import("node:fs");
+  const printFooter = (): void => {
+    console.log(
+      `Google state: ${existsSync(PATHS.googleStateFile) ? "present" : "NOT FOUND (run setup)"}`
+    );
+    console.log(
+      `Log file: ${existsSync(PATHS.logFile) ? PATHS.logFile : `${PATHS.logFile} (not created yet)`}`
+    );
+  };
+
   const creds = await readCredentials();
 
   if (!creds) {
     console.log("Credentials file: not found");
     console.log("Status: NOT AUTHENTICATED");
+    printFooter();
 
     return;
   }
@@ -317,6 +325,7 @@ async function showStatus(): Promise<void> {
   if (!creds.claudeAiOauth) {
     console.log("Credentials file: exists but no OAuth tokens");
     console.log("Status: NOT AUTHENTICATED");
+    printFooter();
 
     return;
   }
@@ -332,14 +341,10 @@ async function showStatus(): Promise<void> {
     console.log(`Subscription: ${creds.claudeAiOauth.subscriptionType}`);
   }
 
-  const { existsSync } = await import("node:fs");
-  const { PATHS } = await import("./constants.js");
-  console.log(
-    `Google state: ${existsSync(PATHS.googleStateFile) ? "present" : "NOT FOUND (run setup)"}`
-  );
+  printFooter();
 }
 
 main().catch((err) => {
-  console.error(`[claude-auto] Fatal: ${err instanceof Error ? err.message : err}`);
+  logger.error(`Fatal: ${errMessage(err)}`);
   process.exit(1);
 });

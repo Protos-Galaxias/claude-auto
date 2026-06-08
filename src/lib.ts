@@ -50,3 +50,5 @@ export {
 } from "./ipc-server.js";
 
 export { installHooks, uninstallHooks } from "./hook-installer.js";
+
+export { logger, errMessage, type LogOptions } from "./logger.js";
