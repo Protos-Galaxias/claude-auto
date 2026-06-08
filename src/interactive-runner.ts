@@ -15,6 +15,7 @@ import {
 import { parseTranscriptUsage, type UsageStats } from "./usage-parser.js";
 import { throwIfAborted, withAbort } from "./abort.js";
 import { detectStartupDialog, wantsBypassPermissions } from "./bypass-dialog.js";
+import { logger } from "./logger.js";
 
 import pty from "node-pty";
 
@@ -109,8 +110,10 @@ export async function runInteractive(opts: RunInteractiveOptions): Promise<RunIn
   } catch (err) {
     if (err instanceof AuthRetryNeeded) {
       throwIfAborted(opts.signal);
-      await authenticate({ force: true, silent: true });
+      logger.warn(`Authentication failed mid-run: ${err.detail}. Re-authenticating and retrying once...`);
+      await authenticate({ force: true });
       throwIfAborted(opts.signal);
+      logger.info("Re-auth complete; retrying the run.");
 
       return await runOnce(opts);
     }

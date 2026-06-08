@@ -7,6 +7,7 @@ import {
   exchangeCodeForTokens,
   type OAuthTokens,
 } from "./oauth.js";
+import { logger } from "./logger.js";
 
 const TIMEOUT_MS = 120_000;
 const REDIRECT_PATTERN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/callback/;
@@ -32,9 +33,9 @@ export async function performHeadlessOAuth(
   const redirectUri = "http://localhost:9999/callback";
   const authorizeUrl = buildAuthorizeUrl(pkce, redirectUri);
 
-  console.log("[claude-auto] Starting OAuth flow...");
+  logger.info("Starting OAuth flow...");
   if (debug) {
-    console.log(`[claude-auto] Authorize URL: ${authorizeUrl}`);
+    logger.info(`Authorize URL: ${authorizeUrl}`);
   }
 
   const browser = await chromium.launch({ headless: !debug });
@@ -54,7 +55,7 @@ export async function performHeadlessOAuth(
 
     const code = await codePromise;
 
-    console.log("[claude-auto] Authorization code captured, exchanging for tokens...");
+    logger.info("Authorization code captured, exchanging for tokens...");
 
     const tokens = await exchangeCodeForTokens(
       code,
@@ -63,7 +64,7 @@ export async function performHeadlessOAuth(
       pkce.state
     );
 
-    console.log("[claude-auto] Tokens obtained successfully.");
+    logger.info("Tokens obtained successfully.");
 
     await context.storageState({ path: PATHS.googleStateFile });
 
@@ -139,9 +140,9 @@ async function handleInterstitialPages(
     const currentUrl = page.url();
 
     if (debug) {
-      console.log(`[claude-auto] [${attempt}] URL: ${currentUrl}`);
+      logger.info(`[${attempt}] URL: ${currentUrl}`);
       const title = await page.title().catch(() => "?");
-      console.log(`[claude-auto] [${attempt}] Title: ${title}`);
+      logger.info(`[${attempt}] Title: ${title}`);
     }
 
     if (REDIRECT_PATTERN.test(currentUrl)) {
@@ -154,7 +155,7 @@ async function handleInterstitialPages(
     }
 
     if (currentUrl.includes("accounts.google.com")) {
-      console.log("[claude-auto] On Google SSO page, waiting for auto-login...");
+      logger.info("On Google SSO page, waiting for auto-login...");
       await tryClickGoogleContinue(page);
       continue;
     }
@@ -166,18 +167,18 @@ async function handleInterstitialPages(
     ) {
       if (debug) {
         const text = await page.locator("body").innerText().catch(() => "");
-        console.log(`[claude-auto] Page text (first 500 chars): ${text.slice(0, 500)}`);
+        logger.info(`Page text (first 500 chars): ${text.slice(0, 500)}`);
       }
-      console.log("[claude-auto] On Anthropic page, checking for consent...");
+      logger.info("On Anthropic page, checking for consent...");
       const clicked = await tryClickAnthropicConsent(page);
       if (!clicked && debug) {
-        console.log("[claude-auto] No consent button found, waiting...");
+        logger.info("No consent button found, waiting...");
       }
       continue;
     }
 
     if (debug) {
-      console.log(`[claude-auto] Unknown page: ${currentUrl}`);
+      logger.info(`Unknown page: ${currentUrl}`);
     }
   }
 }
@@ -198,7 +199,7 @@ async function tryClickGoogleContinue(
       const el = page.locator(selector).first();
       if (await el.isVisible({ timeout: 1000 })) {
         await el.click();
-        console.log(`[claude-auto] Clicked Google button: ${selector}`);
+        logger.info(`Clicked Google button: ${selector}`);
 
         return;
       }
@@ -224,7 +225,7 @@ async function tryClickAnthropicConsent(
       const el = page.locator(selector).first();
       if (await el.isVisible({ timeout: 1000 })) {
         await el.click();
-        console.log(`[claude-auto] Clicked Anthropic consent: ${selector}`);
+        logger.info(`Clicked Anthropic consent: ${selector}`);
 
         return true;
       }
