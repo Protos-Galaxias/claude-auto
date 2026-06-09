@@ -155,17 +155,36 @@ schtasks /create /tn "claude-auto-refresh" /tr "claude-auto refresh" /sc weekly 
 |----------|---------|
 | "Google session state not found" | Запусти `claude-auto setup` или скопируй `google-state.json` на сервер |
 | "OAuth flow timed out" | Google-сессия протухла. Запусти `claude-auto setup` заново |
+| "no active Max/Pro subscription" | На этом Google-аккаунте нет активной подписки Max/Pro. Claude Code-токен выдать нельзя — проверь подписку или сделай `setup` правильным аккаунтом |
 | "Token exchange failed" | Проверь что подписка (Pro/Max) активна |
+| Браузер не открывается / падает на сервере | Re-auth теперь **headful** (см. ниже). На headless-сервере нужен `xvfb` |
 | Google просит 2FA | IP сервера сильно отличается от того где делал setup. Сделай setup прямо на сервере через VNC |
+
+---
+
+## ⚠️ Re-auth открывает реальный браузер (headful)
+
+claude.ai теперь защищён Cloudflare, который **блокирует headless-браузер**. Поэтому полный re-auth (когда `refresh_token` мёртв) запускает **видимый** Chromium. На десктопе просто откроется окно. На **headless-сервере** нужен виртуальный дисплей:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y xvfb
+# Запускать refresh/claude-auto под виртуальным дисплеем:
+xvfb-run -a claude-auto refresh
+xvfb-run -a claude-auto -p "..."
+```
+
+Аккаунт обязан иметь **активную подписку Max/Pro** — иначе claude.ai не даёт авторизовать Claude Code (в логе будет "no active Max/Pro subscription").
+
+> Лучшая профилактика — недельный cron `claude-auto refresh` (раздел выше): пока `refresh_token` жив, браузер вообще не запускается (чистый HTTP-refresh, без Cloudflare и дисплея).
 
 ---
 
 ## Как это работает (коротко)
 
 1. `claude-auto` запускает `claude` с твоими аргументами
-2. Если `claude` вернул 401 — запускается headless-браузер с твоей сохранённой Google-сессией
-3. Браузер автоматически проходит OAuth на claude.ai (Google SSO → Authorize → получает код)
-4. Код обменивается на свежие токены → записывает в `~/.claude/.credentials.json`
-5. Повторяет исходную команду `claude`
-
-Ты ничего не делаешь — всё происходит само.
+2. Если `claude` вернул 401 — сначала пробуется HTTP-refresh по `refresh_token` (без браузера)
+3. Если refresh не помог — запускается **headful**-браузер с сохранённой Google-сессией
+4. Браузер проходит OAuth на claude.ai: Cloudflare → `Continue with Google` → попап Google (выбор аккаунта) → `Authorize` → получает код
+5. Код обменивается на свежие токены → записывает в `~/.claude/.credentials.json`
+6. Повторяет исходную команду `claude`
