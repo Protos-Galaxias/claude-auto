@@ -4,7 +4,9 @@ Drop-in wrapper for `claude` CLI that automatically re-authenticates when OAuth 
 
 ## Problem
 
-Claude Code with Max subscription uses OAuth tokens that expire every ~30 days. On remote servers this requires manual re-login: SSH in, run `claude /login`, copy URL to browser, copy code back. `claude-auto` eliminates this by re-authenticating headlessly using a saved Google session.
+Claude Code with Max subscription uses OAuth tokens that expire every ~30 days. On remote servers this requires manual re-login: SSH in, run `claude /login`, copy URL to browser, copy code back. `claude-auto` eliminates this by re-authenticating through a saved Google session.
+
+> **Note:** claude.ai is now behind a Cloudflare challenge that blocks headless browsers, so the full OAuth re-auth runs a **headful** Chromium. On a desktop a window opens; on a headless server wrap the command with `xvfb-run -a` (see SETUP.md). The fast path — refreshing an existing `refresh_token` over plain HTTP — needs no browser at all, so keep the weekly cron alive.
 
 ## How it works
 
@@ -12,8 +14,8 @@ Claude Code with Max subscription uses OAuth tokens that expire every ~30 days. 
 2. If `claude` succeeds — output is passed through, nothing changes
 3. If `claude` fails with 401 — `claude-auto`:
    - First tries to refresh the existing token (fast, no browser)
-   - If refresh fails, launches headless Chromium with your saved Google session
-   - Passes through Anthropic OAuth automatically (Google SSO + consent)
+   - If refresh fails, launches headful Chromium with your saved Google session (`xvfb-run` on headless servers)
+   - Passes through claude.ai OAuth automatically (Cloudflare → Continue with Google → popup account pick → Authorize)
    - Writes fresh tokens to `~/.claude/.credentials.json`
    - Retries the original command
 
@@ -193,7 +195,7 @@ claude-auto -p '...'
        │    ├─ Success → retry claude → done
        │    └─ Fail (refresh token dead)
        │
-       └─ Full OAuth re-auth (headless Playwright)
+       └─ Full OAuth re-auth (headful Playwright; xvfb on servers)
             ├─ Success → retry claude → done
             └─ Fail → print error, suggest 'claude-auto setup'
 ```

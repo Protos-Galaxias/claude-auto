@@ -3,7 +3,10 @@ import { join } from "node:path";
 
 export const OAUTH = {
   clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  authorizeUrl: "https://platform.claude.com/oauth/authorize",
+  // Max/Pro subscription accounts authenticate via the claude.ai chat flow.
+  // platform.claude.com is the Console/API account login (wrong billing pool)
+  // and also lacks the Google-popup login we automate against.
+  authorizeUrl: "https://claude.ai/oauth/authorize",
   tokenUrl: "https://platform.claude.com/v1/oauth/token",
   scopes: [
     "user:profile",
