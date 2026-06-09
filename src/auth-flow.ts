@@ -130,10 +130,15 @@ function waitForAuthCode(page: import("playwright").Page): Promise<string> {
   });
 }
 
+const STUCK_LIMIT = 4;
+
 async function handleInterstitialPages(
   page: import("playwright").Page,
   debug: boolean
 ): Promise<void> {
+  let lastConsentUrl = "";
+  let stuckCount = 0;
+
   for (let attempt = 0; attempt < 15; attempt++) {
     await page.waitForTimeout(2000);
 
@@ -171,15 +176,69 @@ async function handleInterstitialPages(
       }
       logger.info("On Anthropic page, checking for consent...");
       const clicked = await tryClickAnthropicConsent(page);
-      if (!clicked && debug) {
+      if (clicked) {
+        logger.info(`Clicked Anthropic consent: ${clicked}`);
+      } else {
         logger.info("No consent button found, waiting...");
       }
+
+      if (currentUrl === lastConsentUrl) {
+        stuckCount++;
+      } else {
+        stuckCount = 0;
+        lastConsentUrl = currentUrl;
+      }
+
+      if (stuckCount >= STUCK_LIMIT) {
+        const buttons = await describeClickables(page);
+        logger.error(
+          `OAuth consent stuck on ${currentUrl} after ${stuckCount} clicks. ` +
+            `Visible clickables: ${JSON.stringify(buttons)}`
+        );
+        throw new Error(
+          "OAuth consent page did not advance — the Anthropic authorize UI likely changed. " +
+            "Re-run with 'claude-auto refresh --debug' to watch the browser, and check " +
+            `${PATHS.logFile} for the logged button list.`
+        );
+      }
+
       continue;
     }
 
     if (debug) {
       logger.info(`Unknown page: ${currentUrl}`);
     }
+  }
+}
+
+/**
+ * Enumerates visible buttons/links/submit inputs on the current page so a stuck
+ * consent flow leaves a breadcrumb in the log (the live Anthropic UI changes and
+ * we can't always guess the right selector ahead of time).
+ */
+async function describeClickables(
+  page: import("playwright").Page
+): Promise<Array<{ tag: string; type: string | null; text: string; disabled: boolean }>> {
+  try {
+    return await page.evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll(
+          'button, a[role="button"], input[type="submit"], [role="button"]'
+        )
+      );
+
+      return nodes
+        .filter((el) => (el as HTMLElement).offsetParent !== null)
+        .slice(0, 25)
+        .map((el) => ({
+          tag: el.tagName.toLowerCase(),
+          type: (el as HTMLInputElement).type ?? null,
+          text: (el.textContent ?? (el as HTMLInputElement).value ?? "").trim().slice(0, 60),
+          disabled: Boolean((el as HTMLButtonElement).disabled),
+        }));
+    });
+  } catch {
+    return [];
   }
 }
 
@@ -211,13 +270,30 @@ async function tryClickGoogleContinue(
 
 async function tryClickAnthropicConsent(
   page: import("playwright").Page
-): Promise<boolean> {
+): Promise<string | null> {
+  // Prefer the explicit OAuth authorize action matched by accessible role/name.
+  // This dodges cookie banners ("Accept all") and disabled placeholder submits
+  // that the broad selector fallbacks below used to latch onto in a loop.
+  try {
+    const byRole = page
+      .getByRole("button", { name: /authorize|allow access|allow|approve|grant/i })
+      .first();
+    if (await byRole.isVisible({ timeout: 1000 })) {
+      const label = (await byRole.textContent())?.trim() || "authorize";
+      await byRole.click();
+
+      return `role:${label}`;
+    }
+  } catch {
+    // fall through to selector fallbacks
+  }
+
   const selectors = [
     'button:has-text("Authorize")',
     'button:has-text("Allow")',
-    'button:has-text("Accept")',
     'button:has-text("Approve")',
-    'button[type="submit"]',
+    'button[type="submit"]:not([disabled])',
+    'button:has-text("Accept")',
   ];
 
   for (const selector of selectors) {
@@ -225,14 +301,13 @@ async function tryClickAnthropicConsent(
       const el = page.locator(selector).first();
       if (await el.isVisible({ timeout: 1000 })) {
         await el.click();
-        logger.info(`Clicked Anthropic consent: ${selector}`);
 
-        return true;
+        return selector;
       }
     } catch {
       // selector not found
     }
   }
 
-  return false;
+  return null;
 }
