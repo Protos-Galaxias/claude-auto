@@ -1,5 +1,6 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
 import { existsSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 import { PATHS } from "./constants.js";
 import {
   generatePKCE,
@@ -51,12 +52,17 @@ export async function performHeadlessOAuth(
     logger.info(`Authorize URL: ${authorizeUrl}`);
   }
 
-  const browser = await chromium.launch({
-    headless: false,
-    args: ["--disable-blink-features=AutomationControlled"],
-  });
+  // Headful Chromium needs an X display. On a headless Linux box (server, cron)
+  // there is none, so spin up Xvfb automatically instead of failing.
+  const stopDisplay = await ensureXDisplay();
 
+  let browser: import("playwright").Browser | null = null;
   try {
+    browser = await chromium.launch({
+      headless: false,
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+
     const context = await browser.newContext({
       storageState: PATHS.googleStateFile,
       userAgent: USER_AGENT,
@@ -98,8 +104,102 @@ export async function performHeadlessOAuth(
 
     return tokens;
   } finally {
-    await browser.close();
+    if (browser) {
+      await browser.close();
+    }
+    stopDisplay();
   }
+}
+
+/**
+ * Ensures Chromium has an X display. On macOS/Windows or when DISPLAY is already
+ * set, does nothing. On a headless Linux host it launches Xvfb on a free display
+ * and returns a cleanup that tears it down. Throws an actionable error if Xvfb
+ * isn't installed.
+ */
+async function ensureXDisplay(): Promise<() => void> {
+  if (process.platform !== "linux") {
+    return () => {};
+  }
+  if (process.env.DISPLAY && process.env.DISPLAY.length > 0) {
+    return () => {};
+  }
+
+  let binaryMissing = false;
+
+  for (let n = 99; n <= 108; n++) {
+    if (existsSync(`/tmp/.X${n}-lock`)) {
+      continue;
+    }
+
+    const display = `:${n}`;
+    const proc = spawn(
+      "Xvfb",
+      [display, "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+      { stdio: "ignore" }
+    );
+
+    const ready = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(ok);
+      };
+
+      proc.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") {
+          binaryMissing = true;
+        }
+        done(false);
+      });
+      proc.on("exit", () => done(false));
+
+      const poll = setInterval(() => {
+        if (existsSync(`/tmp/.X${n}-lock`)) {
+          clearInterval(poll);
+          done(true);
+        }
+      }, 100);
+
+      setTimeout(() => {
+        clearInterval(poll);
+        done(existsSync(`/tmp/.X${n}-lock`));
+      }, 3000);
+    });
+
+    if (binaryMissing) {
+      throw xvfbMissingError();
+    }
+
+    if (!ready) {
+      proc.kill("SIGKILL");
+      continue;
+    }
+
+    process.env.DISPLAY = display;
+    logger.info(`No DISPLAY set — started Xvfb on ${display}.`);
+
+    return () => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    };
+  }
+
+  throw xvfbMissingError();
+}
+
+function xvfbMissingError(): Error {
+  return new Error(
+    "Headful browser needs an X display, but none is available.\n" +
+      "Install a virtual display:  sudo apt-get install -y xvfb\n" +
+      "Then re-run normally, or wrap the command:  xvfb-run -a claude-auto refresh"
+  );
 }
 
 function extractCode(url: string): string | null {
