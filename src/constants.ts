@@ -26,6 +26,7 @@ export const PATHS = {
   googleStateFile: join(homedir(), ".claude-auto", "google-state.json"),
   hookRelayScript: join(homedir(), ".claude-auto", "hook-relay.sh"),
   logFile: join(homedir(), ".claude-auto", "claude-auto.log"),
+  diagnosticsDir: join(homedir(), ".claude-auto", "diagnostics"),
 } as const;
 
 export const HOOK_RELAY_ENV = "CLAUDE_AUTO_RUN_SOCKET" as const;

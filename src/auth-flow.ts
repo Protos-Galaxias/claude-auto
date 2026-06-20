@@ -1,5 +1,6 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { PATHS } from "./constants.js";
 import {
@@ -57,6 +58,7 @@ export async function performHeadlessOAuth(
   const stopDisplay = await ensureXDisplay();
 
   let browser: import("playwright").Browser | null = null;
+  let mainPage: Page | null = null;
   try {
     browser = await chromium.launch({
       headless: false,
@@ -72,6 +74,7 @@ export async function performHeadlessOAuth(
     const codePromise = waitForAuthCode(context);
 
     const page = await context.newPage();
+    mainPage = page;
 
     // Register AFTER the main page exists so the popup driver only runs on the
     // Google popup, not on the main claude.ai tab.
@@ -103,6 +106,14 @@ export async function performHeadlessOAuth(
     await context.storageState({ path: PATHS.googleStateFile });
 
     return tokens;
+  } catch (err) {
+    // Capture the main tab's final state on any failure (incl. the 180s code
+    // timeout) so a stalled re-auth is diagnosable after the fact. The
+    // per-step dumps above are more specific; this is the catch-all.
+    if (mainPage) {
+      await dumpPage(mainPage, "oauth-failed").catch(() => null);
+    }
+    throw err;
   } finally {
     if (browser) {
       await browser.close();
@@ -265,8 +276,10 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
   let clickedGoogle = false;
   let lastUrl = "";
   let stuck = 0;
+  let loginButtonWait = 0;
+  const googleClickedUrls = new Set<string>();
 
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < 75; attempt++) {
     if (page.isClosed()) {
       return;
     }
@@ -291,14 +304,46 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
       continue;
     }
 
-    if (!clickedGoogle && /claude\.(ai|com)/.test(safeHost(url))) {
+    // claude.ai may bounce the main tab back to a login / account-selection
+    // page after the Google popup completes (e.g. ?selectAccount=true), where
+    // "Continue with Google" must be clicked AGAIN. The button is often a
+    // "Loading..." skeleton for a few seconds before it renders, so we retry
+    // on every distinct login URL rather than latching after the first click.
+    if (isClaudeLoginPage(url, clickedGoogle)) {
+      if (googleClickedUrls.has(url)) {
+        // Already clicked Google on this exact URL; the popup/redirect should
+        // be in flight. Don't re-click (avoids loops), just wait it out.
+        continue;
+      }
       if (await clickByText(page, /continue with google/i)) {
-        logger.info("Clicked 'Continue with Google'.");
+        logger.info(`Clicked 'Continue with Google'${clickedGoogle ? " (re-prompt)" : ""}.`);
         clickedGoogle = true;
+        googleClickedUrls.add(url);
         stuck = 0;
+        loginButtonWait = 0;
         lastUrl = url;
         continue;
       }
+
+      // Button not rendered yet (commonly shows "Loading..."). Keep waiting,
+      // but fail with an actionable error if it never appears.
+      loginButtonWait++;
+      if (loginButtonWait >= 20) {
+        const buttons = await describeClickables(page);
+        logger.error(
+          `claude.ai login page never rendered a 'Continue with Google' button on ${url} ("${title}"). ` +
+            `Visible clickables: ${JSON.stringify(buttons)}`
+        );
+        await dumpPage(page, "login-no-google-button");
+        throw new Error(
+          "claude.ai login page never showed a 'Continue with Google' button — the login UI likely changed. " +
+            `Re-run with --debug and inspect the saved page dump under ${PATHS.diagnosticsDir}.`
+        );
+      }
+      if (debug) {
+        logger.info(`[main ${attempt}] login page, Google button not ready (wait ${loginButtonWait})`);
+      }
+      continue;
     }
 
     // Cookie banner can overlay the authorize button — dismiss it once.
@@ -349,12 +394,33 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
       logger.error(
         `OAuth main tab stuck on ${url} ("${title}"). Visible clickables: ${JSON.stringify(buttons)}`
       );
+      await dumpPage(page, "main-tab-stuck");
       throw new Error(
         "OAuth flow stalled on the claude.ai page — the login/consent UI likely changed. " +
-          `Re-run with --debug and check ${PATHS.logFile} for the logged button list.`
+          `Re-run with --debug and inspect the saved page dump under ${PATHS.diagnosticsDir}.`
       );
     }
   }
+}
+
+/**
+ * True when the main tab is sitting on a claude.ai/.com login or
+ * account-selection screen where "Continue with Google" should be clicked.
+ *
+ * Before the first Google click, any claude host counts (the initial
+ * authorize URL lands on the login screen). After it, we only treat explicit
+ * login / account-selection URLs as re-prompts so the oauth/authorize consent
+ * page isn't mistaken for a login page.
+ */
+export function isClaudeLoginPage(url: string, clickedGoogle: boolean): boolean {
+  if (!/claude\.(ai|com)/.test(safeHost(url))) {
+    return false;
+  }
+  if (!clickedGoogle) {
+    return true;
+  }
+
+  return /\/login\b/.test(url) || /selectaccount=true/i.test(url);
 }
 
 /**
@@ -363,6 +429,8 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
  * the saved Google session being live.
  */
 async function driveGooglePopup(popup: Page, debug: boolean): Promise<void> {
+  let acted = false;
+
   try {
     await popup.waitForLoadState("domcontentloaded").catch(() => {});
 
@@ -396,6 +464,7 @@ async function driveGooglePopup(popup: Page, debug: boolean): Promise<void> {
         await clickByText(popup, /^(continue|allow|next|confirm|continue to claude|продолжить|подтвердить|разрешить|далее)/i)
       ) {
         logger.info("Google: clicked continue/allow.");
+        acted = true;
         continue;
       }
 
@@ -403,13 +472,21 @@ async function driveGooglePopup(popup: Page, debug: boolean): Promise<void> {
       // re-clicking the same tile in a loop.
       if (changed && (await pickGoogleAccount(popup))) {
         logger.info("Google: selected saved account.");
+        acted = true;
         continue;
       }
     }
-  } catch (err) {
-    if (debug) {
-      logger.warn(`Google popup handler error: ${err instanceof Error ? err.message : err}`);
+
+    // Looped the full budget on a Google page without ever advancing it —
+    // most likely a 2FA / "verify it's you" / consent screen we can't auto-pass.
+    // Capture it so the operator can see exactly what Google asked for.
+    if (!acted && !popup.isClosed() && safeHost(popup.url()).includes("google.com")) {
+      logger.error("Google popup never advanced — possible 2FA / verification challenge.");
+      await dumpPage(popup, "google-popup-stuck");
     }
+  } catch (err) {
+    logger.warn(`Google popup handler error: ${errText(err)}`);
+    await dumpPage(popup, "google-popup-error");
   }
 }
 
@@ -522,4 +599,72 @@ function safeHost(url: string): string {
   } catch {
     return "?";
   }
+}
+
+/**
+ * Persists everything we know about a page at a failure point so a stalled
+ * re-auth can be diagnosed after the fact (2FA prompt, captcha, "verify it's
+ * you", changed login UI, etc.). Writes into a timestamped folder under
+ * PATHS.diagnosticsDir:
+ *   - page.html      full rendered DOM
+ *   - page.png       full-page screenshot
+ *   - meta.json      url, title, label, clickables list
+ *
+ * Best-effort: any failure here is logged and swallowed so it never masks the
+ * original error. Returns the dump directory (or null if nothing was written).
+ */
+async function dumpPage(page: Page, label: string): Promise<string | null> {
+  if (page.isClosed()) {
+    return null;
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dir = join(PATHS.diagnosticsDir, `${stamp}_${slug(label)}`);
+
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    logger.warn(`Could not create diagnostics dir ${dir}: ${errText(err)}`);
+
+    return null;
+  }
+
+  const url = page.url();
+  const title = await page.title().catch(() => "?");
+  const clickables = await describeClickables(page);
+
+  try {
+    const html = await page.content();
+    writeFileSync(join(dir, "page.html"), html, { encoding: "utf8" });
+  } catch (err) {
+    logger.warn(`Diagnostics: failed to capture HTML: ${errText(err)}`);
+  }
+
+  try {
+    await page.screenshot({ path: join(dir, "page.png"), fullPage: true });
+  } catch (err) {
+    logger.warn(`Diagnostics: failed to capture screenshot: ${errText(err)}`);
+  }
+
+  try {
+    writeFileSync(
+      join(dir, "meta.json"),
+      JSON.stringify({ label, url, title, clickables, capturedAt: stamp }, null, 2) + "\n",
+      { encoding: "utf8" }
+    );
+  } catch (err) {
+    logger.warn(`Diagnostics: failed to write meta.json: ${errText(err)}`);
+  }
+
+  logger.error(`Saved page diagnostics to ${dir} (url=${url}, title="${title}").`);
+
+  return dir;
+}
+
+function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "dump";
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
