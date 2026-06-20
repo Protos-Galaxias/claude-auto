@@ -265,8 +265,10 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
   let clickedGoogle = false;
   let lastUrl = "";
   let stuck = 0;
+  let loginButtonWait = 0;
+  const googleClickedUrls = new Set<string>();
 
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < 75; attempt++) {
     if (page.isClosed()) {
       return;
     }
@@ -291,14 +293,45 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
       continue;
     }
 
-    if (!clickedGoogle && /claude\.(ai|com)/.test(safeHost(url))) {
+    // claude.ai may bounce the main tab back to a login / account-selection
+    // page after the Google popup completes (e.g. ?selectAccount=true), where
+    // "Continue with Google" must be clicked AGAIN. The button is often a
+    // "Loading..." skeleton for a few seconds before it renders, so we retry
+    // on every distinct login URL rather than latching after the first click.
+    if (isClaudeLoginPage(url, clickedGoogle)) {
+      if (googleClickedUrls.has(url)) {
+        // Already clicked Google on this exact URL; the popup/redirect should
+        // be in flight. Don't re-click (avoids loops), just wait it out.
+        continue;
+      }
       if (await clickByText(page, /continue with google/i)) {
-        logger.info("Clicked 'Continue with Google'.");
+        logger.info(`Clicked 'Continue with Google'${clickedGoogle ? " (re-prompt)" : ""}.`);
         clickedGoogle = true;
+        googleClickedUrls.add(url);
         stuck = 0;
+        loginButtonWait = 0;
         lastUrl = url;
         continue;
       }
+
+      // Button not rendered yet (commonly shows "Loading..."). Keep waiting,
+      // but fail with an actionable error if it never appears.
+      loginButtonWait++;
+      if (loginButtonWait >= 20) {
+        const buttons = await describeClickables(page);
+        logger.error(
+          `claude.ai login page never rendered a 'Continue with Google' button on ${url} ("${title}"). ` +
+            `Visible clickables: ${JSON.stringify(buttons)}`
+        );
+        throw new Error(
+          "claude.ai login page never showed a 'Continue with Google' button — the login UI likely changed. " +
+            `Re-run with --debug and check ${PATHS.logFile} for the logged button list.`
+        );
+      }
+      if (debug) {
+        logger.info(`[main ${attempt}] login page, Google button not ready (wait ${loginButtonWait})`);
+      }
+      continue;
     }
 
     // Cookie banner can overlay the authorize button — dismiss it once.
@@ -355,6 +388,26 @@ async function driveConsentFlow(page: Page, options: ConsentFlowOptions): Promis
       );
     }
   }
+}
+
+/**
+ * True when the main tab is sitting on a claude.ai/.com login or
+ * account-selection screen where "Continue with Google" should be clicked.
+ *
+ * Before the first Google click, any claude host counts (the initial
+ * authorize URL lands on the login screen). After it, we only treat explicit
+ * login / account-selection URLs as re-prompts so the oauth/authorize consent
+ * page isn't mistaken for a login page.
+ */
+export function isClaudeLoginPage(url: string, clickedGoogle: boolean): boolean {
+  if (!/claude\.(ai|com)/.test(safeHost(url))) {
+    return false;
+  }
+  if (!clickedGoogle) {
+    return true;
+  }
+
+  return /\/login\b/.test(url) || /selectaccount=true/i.test(url);
 }
 
 /**
